@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-import gensim
-from gensim.models import Word2Vec
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from sklearn.decomposition import PCA
@@ -106,33 +104,149 @@ def preprocess_text(text):
     # Tokenize
     return text.split()
 
-# Function to create embeddings using Word2Vec
-def create_word2vec_embeddings(descriptions, vector_size=100, window=5, min_count=1, epochs=100):
-    # Preprocess descriptions
-    processed_descriptions = {code: preprocess_text(desc) for code, desc in descriptions.items()}
+# Create manually designed embeddings based on medical concepts
+def create_manual_embeddings(descriptions, dim=30):
+    # We'll create embeddings manually by mapping terms to specific dimensions
     
-    # Prepare data for Word2Vec
-    sentences = list(processed_descriptions.values())
+    # Map of medical terms to dimension indices
+    term_to_dim = {
+        "diabetes": 0,
+        "type 1": 1,
+        "type 2": 2,
+        "mellitus": 3,
+        "hypertension": 4,
+        "heart": 5,
+        "asthma": 6,
+        "pain": 7,
+        "back": 8,
+        "anxiety": 9,
+        "depression": 10,
+        "gastro": 11,
+        "reflux": 12,
+        "chronic": 13,
+        "esophageal": 14,
+        "peripheral": 15,
+        "angiopathy": 16,
+        "hypertensive": 17,
+        "radiculopathy": 18,
+        "lumbar": 19,
+        "disorder": 20,
+        "without": 21,
+        "with": 22,
+        "uncomplicated": 23,
+        "failure": 24,
+        "complication": 25,
+        "migraine": 26,
+        "unspecified": 27,
+        "intermittent": 28,
+        "irritable": 29
+    }
     
-    # Train Word2Vec model
-    model = Word2Vec(sentences=sentences, vector_size=vector_size, window=window, 
-                     min_count=min_count, workers=4, epochs=epochs)
-    
-    # Create embeddings for each ICD-10 code
+    # Create embeddings dictionary
     embeddings = {}
-    for code, tokens in processed_descriptions.items():
-        # Get word vectors for each token in the description
-        word_vectors = [model.wv[word] for word in tokens if word in model.wv]
+    
+    # For each code and description
+    for code, desc in descriptions.items():
+        # Initialize embedding vector
+        embedding = np.zeros(dim)
         
-        if word_vectors:
-            # Average the word vectors to get a single vector for the code
-            embedding = np.mean(word_vectors, axis=0)
-        else:
-            embedding = np.zeros(vector_size)
+        # Process the description
+        tokens = preprocess_text(desc)
         
+        # For each token in the description
+        for token in tokens:
+            # If token is a known medical term, activate its dimension
+            if token in term_to_dim:
+                dim_idx = term_to_dim[token]
+                embedding[dim_idx] = 1.0
+        
+        # Add some relatedness between similar conditions
+        
+        # Diabetes related - dims 0,1,2,3
+        if "diabetes" in desc.lower():
+            if "type 1" in desc.lower():
+                embedding[0] = 1.0
+                embedding[1] = 1.0
+                embedding[3] = 1.0
+            elif "type 2" in desc.lower():
+                embedding[0] = 1.0
+                embedding[2] = 1.0
+                embedding[3] = 1.0
+        
+        # Hypertension related - dims 4,5,17
+        if "hypertension" in desc.lower() or "hypertensive" in desc.lower():
+            embedding[4] = 1.0
+            if "heart" in desc.lower():
+                embedding[5] = 1.0
+                embedding[17] = 1.0
+        
+        # Asthma related - dim 6
+        if "asthma" in desc.lower():
+            embedding[6] = 1.0
+            if "mild" in desc.lower() and "intermittent" in desc.lower():
+                embedding[28] = 1.0
+        
+        # Pain related - dims 7,8,13,18,19
+        if "pain" in desc.lower():
+            embedding[7] = 1.0
+            if "back" in desc.lower():
+                embedding[8] = 1.0
+            if "chronic" in desc.lower():
+                embedding[13] = 1.0
+            if "radiculopathy" in desc.lower():
+                embedding[18] = 1.0
+            if "lumbar" in desc.lower():
+                embedding[19] = 1.0
+        
+        # Scale by ICD-10 code prefix
+        prefix = code.split('.')[0]
+        
+        # E codes: endocrine disorders like diabetes
+        if prefix.startswith('E'):
+            embedding[0:5] *= 1.5
+        
+        # I codes: circulatory system disorders like hypertension
+        if prefix.startswith('I'):
+            embedding[4:7] *= 1.5
+        
+        # J codes: respiratory system disorders like asthma
+        if prefix.startswith('J'):
+            embedding[6:7] *= 1.5
+        
+        # M codes: musculoskeletal disorders like back pain
+        if prefix.startswith('M'):
+            embedding[7:10] *= 1.5
+        
+        # F codes: mental disorders like anxiety
+        if prefix.startswith('F'):
+            embedding[9:11] *= 1.5
+        
+        # G codes: nervous system disorders
+        if prefix.startswith('G'):
+            embedding[13:14] *= 1.5
+            embedding[26:27] *= 1.5
+        
+        # K codes: digestive system disorders
+        if prefix.startswith('K'):
+            embedding[11:13] *= 1.5
+            embedding[29:30] *= 1.5
+        
+        # Store the embedding
         embeddings[code] = embedding
     
     return embeddings
+
+# Function to compute cosine similarity
+def cosine_similarity(v1, v2):
+    dot_product = np.dot(v1, v2)
+    norm_v1 = np.linalg.norm(v1)
+    norm_v2 = np.linalg.norm(v2)
+    
+    # Avoid division by zero
+    if norm_v1 == 0 or norm_v2 == 0:
+        return 0
+    
+    return dot_product / (norm_v1 * norm_v2)
 
 # Function to reduce dimensionality
 def reduce_dimensions(embeddings_dict, n_components=10):
@@ -235,9 +349,8 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
     
     # Step 2: Create Embeddings
     with st.spinner("Creating embeddings from ICD-10 descriptions..."):
-        # Create Word2Vec embeddings
-        vector_size = 32  # Smaller vector size for faster computation
-        embeddings = create_word2vec_embeddings(icd_descriptions, vector_size=vector_size, epochs=50)
+        # Create manual embeddings
+        embeddings = create_manual_embeddings(icd_descriptions)
         
         # Display embedding information
         first_code = list(embeddings.keys())[0]
@@ -249,23 +362,17 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         
         # Let's check if diabetes codes are similar
         if "E11.9" in embeddings and "E10.9" in embeddings:
-            diabetes_sim = np.dot(embeddings["E11.9"], embeddings["E10.9"]) / (
-                np.linalg.norm(embeddings["E11.9"]) * np.linalg.norm(embeddings["E10.9"])
-            )
+            diabetes_sim = cosine_similarity(embeddings["E11.9"], embeddings["E10.9"])
             st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'E10.9' (Type 1 diabetes): {diabetes_sim:.4f}")
         
         # Check if asthma codes are similar
         if "J45.909" in embeddings and "J45.20" in embeddings:
-            asthma_sim = np.dot(embeddings["J45.909"], embeddings["J45.20"]) / (
-                np.linalg.norm(embeddings["J45.909"]) * np.linalg.norm(embeddings["J45.20"])
-            )
+            asthma_sim = cosine_similarity(embeddings["J45.909"], embeddings["J45.20"])
             st.write(f"Similarity between 'J45.909' (Unspecified asthma) and 'J45.20' (Mild asthma): {asthma_sim:.4f}")
         
         # Check if unrelated codes are less similar
         if "E11.9" in embeddings and "J45.909" in embeddings:
-            unrelated_sim = np.dot(embeddings["E11.9"], embeddings["J45.909"]) / (
-                np.linalg.norm(embeddings["E11.9"]) * np.linalg.norm(embeddings["J45.909"])
-            )
+            unrelated_sim = cosine_similarity(embeddings["E11.9"], embeddings["J45.909"])
             st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'J45.909' (Asthma): {unrelated_sim:.4f}")
     
     # Step 3: Reduce Dimensions
@@ -378,7 +485,7 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         This demonstration shows how embeddings can effectively represent ICD-10 codes in a predictive model:
         
         1. We started with raw ICD-10 codes and their text descriptions
-        2. We used Word2Vec to create embeddings that place similar medical conditions near each other in vector space
+        2. We created embeddings that place similar medical conditions near each other in vector space
         3. We reduced the embeddings to exactly 10 dimensions using PCA
         4. We used these embeddings along with demographic features to predict healthcare costs
         5. We analyzed which embedding dimensions were most important for prediction

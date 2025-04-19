@@ -1,18 +1,14 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pickle
-import os
 import xgboost as xgb
-import shap
+import gensim
+from gensim.models import Word2Vec
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
-from sentence_transformers import SentenceTransformer
-from umap import UMAP
 from sklearn.decomposition import PCA
-import time
+import string
+import random
 
 # Set page config
 st.set_page_config(page_title="ICD-10 Embedding Demo", layout="wide")
@@ -21,53 +17,31 @@ st.set_page_config(page_title="ICD-10 Embedding Demo", layout="wide")
 st.title("ICD-10 Code Embedding for Healthcare Cost Prediction")
 st.markdown("""
 This application demonstrates how embedding ICD-10 diagnosis codes can improve healthcare cost prediction models.
-Instead of treating each code as a separate variable, we convert them into meaningful numerical vectors that capture their semantic relationships.
+Instead of treating each code as a separate variable, we convert them into meaningful numerical vectors.
 """)
 
-# Sidebar for navigation
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Data Preparation", "Create Embeddings", "Dimensionality Reduction", "XGBoost Prediction", "SHAP Explanation"])
-
-# Initialize session state variables if they don't exist
-if 'raw_data' not in st.session_state:
-    st.session_state.raw_data = None
-if 'icd_descriptions' not in st.session_state:
-    st.session_state.icd_descriptions = None
-if 'embeddings' not in st.session_state:
-    st.session_state.embeddings = None
-if 'reduced_embeddings' not in st.session_state:
-    st.session_state.reduced_embeddings = None
-if 'model' not in st.session_state:
-    st.session_state.model = None
-if 'X_test' not in st.session_state:
-    st.session_state.X_test = None
-if 'y_test' not in st.session_state:
-    st.session_state.y_test = None
-if 'shap_values' not in st.session_state:
-    st.session_state.shap_values = None
-
 # Sample data generator
-def generate_sample_data(num_members=1000):
+def generate_sample_data(num_members=500):
     # Create member IDs
     member_ids = [f"MEM{i:05d}" for i in range(1, num_members + 1)]
     
     # Common ICD-10 codes with descriptions
     icd10_codes = {
         "E11.9": "Type 2 diabetes mellitus without complications",
-        "I10": "Essential (primary) hypertension",
-        "J45.909": "Unspecified asthma, uncomplicated",
+        "E11.51": "Type 2 diabetes mellitus with diabetic peripheral angiopathy",
+        "E10.9": "Type 1 diabetes mellitus without complications",
+        "I10": "Essential primary hypertension",
+        "I11.9": "Hypertensive heart disease without heart failure",
+        "J45.909": "Unspecified asthma uncomplicated",
+        "J45.20": "Mild intermittent asthma uncomplicated",
         "M54.5": "Low back pain",
+        "M54.16": "Radiculopathy lumbar region",
         "F41.1": "Generalized anxiety disorder",
+        "F32.9": "Major depressive disorder single episode unspecified",
         "K21.9": "Gastro-esophageal reflux disease without esophagitis",
+        "K58.9": "Irritable bowel syndrome without diarrhea",
         "G89.29": "Other chronic pain",
-        "E78.5": "Hyperlipidemia, unspecified",
-        "N39.0": "Urinary tract infection, site not specified",
-        "M17.9": "Osteoarthritis of knee, unspecified",
-        "H40.9": "Unspecified glaucoma",
-        "E03.9": "Hypothyroidism, unspecified",
-        "J30.1": "Allergic rhinitis due to pollen",
-        "K57.30": "Diverticulosis of large intestine without perforation or abscess without bleeding",
-        "D64.9": "Anemia, unspecified"
+        "G43.909": "Migraine unspecified not intractable without status migrainosus"
     }
     
     # Create a dataset
@@ -87,13 +61,13 @@ def generate_sample_data(num_members=1000):
         base_amount = 500
         
         # Certain conditions cost more
-        if "E11.9" in codes:  # Diabetes adds cost
+        if "E11.9" in codes or "E11.51" in codes or "E10.9" in codes:  # Diabetes adds cost
             base_amount += 300
-        if "I10" in codes:    # Hypertension adds cost
+        if "I10" in codes or "I11.9" in codes:  # Hypertension adds cost
             base_amount += 200
-        if "M17.9" in codes:  # Knee osteoarthritis adds cost
-            base_amount += 400
-        if "G89.29" in codes: # Chronic pain adds cost
+        if "M54.5" in codes or "M54.16" in codes:  # Back pain adds cost
+            base_amount += 150
+        if "G89.29" in codes:  # Chronic pain adds cost
             base_amount += 250
         
         # Age factor
@@ -120,39 +94,54 @@ def generate_sample_data(num_members=1000):
     
     return df, icd_descriptions
 
-# Function to load pretrained model
-@st.cache_resource
-def load_embedding_model():
-    # Load a sentence transformer model for embeddings
-    try:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        return model
-    except:
-        st.error("Failed to load the embedding model. Please install sentence-transformers package.")
-        return None
-
-# Function to create embeddings
-def create_embeddings(descriptions, model):
-    # Create embeddings from the ICD-10 code descriptions
-    texts = list(descriptions.values())
-    embeddings = model.encode(texts)
+# Function to preprocess text
+def preprocess_text(text):
+    # Convert to lowercase
+    text = text.lower()
     
-    # Create a dictionary mapping ICD-10 codes to their embeddings
-    embedding_dict = {code: embeddings[i] for i, code in enumerate(descriptions.keys())}
-    return embedding_dict
+    # Remove punctuation
+    translator = str.maketrans('', '', string.punctuation)
+    text = text.translate(translator)
+    
+    # Tokenize
+    return text.split()
+
+# Function to create embeddings using Word2Vec
+def create_word2vec_embeddings(descriptions, vector_size=100, window=5, min_count=1, epochs=100):
+    # Preprocess descriptions
+    processed_descriptions = {code: preprocess_text(desc) for code, desc in descriptions.items()}
+    
+    # Prepare data for Word2Vec
+    sentences = list(processed_descriptions.values())
+    
+    # Train Word2Vec model
+    model = Word2Vec(sentences=sentences, vector_size=vector_size, window=window, 
+                     min_count=min_count, workers=4, epochs=epochs)
+    
+    # Create embeddings for each ICD-10 code
+    embeddings = {}
+    for code, tokens in processed_descriptions.items():
+        # Get word vectors for each token in the description
+        word_vectors = [model.wv[word] for word in tokens if word in model.wv]
+        
+        if word_vectors:
+            # Average the word vectors to get a single vector for the code
+            embedding = np.mean(word_vectors, axis=0)
+        else:
+            embedding = np.zeros(vector_size)
+        
+        embeddings[code] = embedding
+    
+    return embeddings
 
 # Function to reduce dimensionality
-def reduce_dimensions(embeddings_dict, method='pca', n_components=10):
+def reduce_dimensions(embeddings_dict, n_components=10):
     # Extract the embeddings and codes
     codes = list(embeddings_dict.keys())
     emb_array = np.array([embeddings_dict[code] for code in codes])
     
     # Perform dimensionality reduction
-    if method == 'pca':
-        reducer = PCA(n_components=n_components)
-    else:  # UMAP
-        reducer = UMAP(n_components=n_components, random_state=42)
-    
+    reducer = PCA(n_components=n_components)
     reduced_embeddings = reducer.fit_transform(emb_array)
     
     # Create a new dictionary mapping codes to reduced embeddings
@@ -168,6 +157,7 @@ def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
     # Prepare the feature matrix
     X_data = []
     y_data = []
+    member_ids = []
     
     for member_id, group in member_groups:
         # Get demographic features (same for all rows of this member)
@@ -192,341 +182,206 @@ def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
         
         X_data.append(features)
         y_data.append(target)
+        member_ids.append(member_id)
     
-    return np.array(X_data), np.array(y_data)
+    return np.array(X_data), np.array(y_data), member_ids
 
-# Function to train XGBoost model
-def train_xgboost(X_train, y_train):
-    model = xgb.XGBRegressor(
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
-    model.fit(X_train, y_train)
-    return model
-
-# Function to evaluate model
-def evaluate_model(model, X_test, y_test):
-    predictions = model.predict(X_test)
-    mae = mean_absolute_error(y_test, predictions)
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    r2 = r2_score(y_test, predictions)
-    return predictions, mae, rmse, r2
-
-# Function to calculate SHAP values
-def calculate_shap(model, X_test):
-    # Create a SHAP explainer
-    explainer = shap.Explainer(model)
-    shap_values = explainer(X_test)
-    return shap_values
-
-# Data Preparation Page
-if page == "Data Preparation":
-    st.header("Step 1: Data Preparation")
+# Calculate feature impact (simplified SHAP alternative)
+def calculate_feature_impact(model, X, feature_names, n_samples=100):
+    # Initialize impact
+    impact = np.zeros(X.shape[1])
     
-    # Option to upload data or use sample data
-    data_option = st.radio(
-        "Choose data source:",
-        ("Generate sample data", "Upload CSV file")
-    )
+    # Get baseline prediction
+    baseline_pred = model.predict(X).mean()
     
-    if data_option == "Generate sample data":
-        num_members = st.slider("Number of members:", 100, 2000, 500)
+    # For each feature, calculate its impact
+    for i in range(X.shape[1]):
+        # Make a copy of the data
+        X_permuted = X.copy()
         
-        if st.button("Generate Sample Data"):
-            with st.spinner("Generating sample data..."):
-                df, icd_descriptions = generate_sample_data(num_members)
-                st.session_state.raw_data = df
-                st.session_state.icd_descriptions = icd_descriptions
-                st.success(f"Generated sample data with {len(df)} records for {num_members} members.")
-    
-    else:
-        uploaded_file = st.file_uploader("Upload your CSV file:", type=["csv"])
-        if uploaded_file is not None:
-            df = pd.read_csv(uploaded_file)
-            st.session_state.raw_data = df
-            
-            # Upload ICD-10 descriptions
-            st.write("Please upload a CSV file with ICD-10 code descriptions (columns: code, description):")
-            desc_file = st.file_uploader("Upload ICD-10 descriptions:", type=["csv"])
-            
-            if desc_file is not None:
-                desc_df = pd.read_csv(desc_file)
-                icd_descriptions = dict(zip(desc_df['code'], desc_df['description']))
-                st.session_state.icd_descriptions = icd_descriptions
-    
-    # Display the data if available
-    if st.session_state.raw_data is not None:
-        st.write("Preview of the data:")
-        st.dataframe(st.session_state.raw_data.head())
+        # Permute the feature
+        X_permuted[:, i] = np.random.permutation(X[:, i])
         
-        st.write("Summary statistics:")
-        st.dataframe(st.session_state.raw_data.describe())
+        # Get new predictions
+        new_preds = model.predict(X_permuted)
         
-        st.write("ICD-10 code distribution:")
-        code_counts = st.session_state.raw_data['icd10_code'].value_counts()
-        fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(x=code_counts.index, y=code_counts.values, ax=ax)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig)
+        # Calculate impact as the difference in predictions
+        impact[i] = baseline_pred - new_preds.mean()
+    
+    # Return as a dict
+    return {feature_names[i]: impact[i] for i in range(len(feature_names))}
 
-# Create Embeddings Page
-elif page == "Create Embeddings":
-    st.header("Step 2: Create ICD-10 Code Embeddings")
-    
-    if st.session_state.icd_descriptions is None:
-        st.warning("Please prepare your data first.")
-    else:
-        st.write("We'll use a pretrained language model to create embeddings for each ICD-10 code description.")
+# Main workflow
+st.header("Step 1: Generate Sample Data")
+num_members = st.slider("Number of members:", 100, 1000, 500)
+
+if st.button("Generate Sample Data and Run Full Pipeline"):
+    # Step 1: Generate Data
+    with st.spinner("Generating sample data..."):
+        df, icd_descriptions = generate_sample_data(num_members)
+        st.success(f"Generated sample data with {len(df)} records for {num_members} members.")
         
-        # Display ICD codes and descriptions
-        st.write("ICD-10 Codes and Descriptions:")
-        desc_df = pd.DataFrame({
-            'Code': list(st.session_state.icd_descriptions.keys()),
-            'Description': list(st.session_state.icd_descriptions.values())
+        # Display sample data
+        st.subheader("Sample Data:")
+        st.dataframe(df.head())
+        
+        # Display ICD-10 codes used
+        st.subheader("ICD-10 Codes and Descriptions:")
+        codes_df = pd.DataFrame({
+            "Code": list(icd_descriptions.keys()),
+            "Description": list(icd_descriptions.values())
         })
-        st.dataframe(desc_df)
-        
-        # Load the embedding model
-        if st.button("Create Embeddings"):
-            with st.spinner("Loading embedding model and creating embeddings..."):
-                model = load_embedding_model()
-                if model:
-                    embeddings = create_embeddings(st.session_state.icd_descriptions, model)
-                    st.session_state.embeddings = embeddings
-                    
-                    # Show embedding dimensions
-                    first_code = list(embeddings.keys())[0]
-                    first_embedding = embeddings[first_code]
-                    st.success(f"Created embeddings for {len(embeddings)} ICD-10 codes. Each embedding has {len(first_embedding)} dimensions.")
-                    
-                    # Show a sample embedding
-                    st.write(f"Sample embedding for code '{first_code}':")
-                    st.write(first_embedding[:10])  # Show first 10 dimensions
-                    
-                    # Visualize embeddings in 2D for a quick check
-                    st.write("2D visualization of embeddings (using PCA):")
-                    temp_reduced, _ = reduce_dimensions(embeddings, method='pca', n_components=2)
-                    
-                    # Create a dataframe for plotting
-                    plot_df = pd.DataFrame({
-                        'Code': list(temp_reduced.keys()),
-                        'Dim1': [emb[0] for emb in temp_reduced.values()],
-                        'Dim2': [emb[1] for emb in temp_reduced.values()]
-                    })
-                    
-                    fig, ax = plt.subplots(figsize=(10, 8))
-                    sns.scatterplot(data=plot_df, x='Dim1', y='Dim2', ax=ax)
-                    
-                    # Add labels to points
-                    for _, row in plot_df.iterrows():
-                        ax.text(row['Dim1'], row['Dim2'], row['Code'], fontsize=9)
-                    
-                    plt.title('2D PCA Visualization of ICD-10 Code Embeddings')
-                    st.pyplot(fig)
-
-# Dimensionality Reduction Page
-elif page == "Dimensionality Reduction":
-    st.header("Step 3: Reduce Embedding Dimensions")
+        st.dataframe(codes_df)
     
-    if st.session_state.embeddings is None:
-        st.warning("Please create embeddings first.")
-    else:
-        st.write("Now we'll reduce the high-dimensional embeddings to a more manageable size.")
+    # Step 2: Create Embeddings
+    with st.spinner("Creating embeddings from ICD-10 descriptions..."):
+        # Create Word2Vec embeddings
+        vector_size = 32  # Smaller vector size for faster computation
+        embeddings = create_word2vec_embeddings(icd_descriptions, vector_size=vector_size, epochs=50)
         
-        # Options for dimensionality reduction
-        reduction_method = st.selectbox("Reduction Method:", ["PCA", "UMAP"])
-        n_components = st.slider("Number of dimensions:", 2, 20, 10)
+        # Display embedding information
+        first_code = list(embeddings.keys())[0]
+        first_embedding = embeddings[first_code]
+        st.success(f"Created embeddings for {len(embeddings)} ICD-10 codes. Original dimension: {len(first_embedding)}")
         
-        if st.button("Reduce Dimensions"):
-            with st.spinner(f"Reducing embeddings to {n_components} dimensions using {reduction_method}..."):
-                method = 'pca' if reduction_method == 'PCA' else 'umap'
-                reduced_embeddings, reducer = reduce_dimensions(st.session_state.embeddings, method=method, n_components=n_components)
-                st.session_state.reduced_embeddings = reduced_embeddings
-                
-                st.success(f"Reduced embeddings to {n_components} dimensions.")
-                
-                # Show a sample reduced embedding
-                first_code = list(reduced_embeddings.keys())[0]
-                st.write(f"Sample reduced embedding for code '{first_code}':")
-                st.write(reduced_embeddings[first_code])
-                
-                # Visualize reduced embeddings in 2D
-                if n_components > 2:
-                    st.write("2D visualization of reduced embeddings (first two dimensions):")
-                    
-                    # Create a dataframe for plotting
-                    plot_df = pd.DataFrame({
-                        'Code': list(reduced_embeddings.keys()),
-                        'Dim1': [emb[0] for emb in reduced_embeddings.values()],
-                        'Dim2': [emb[1] for emb in reduced_embeddings.values()]
-                    })
-                    
-                    fig, ax = plt.subplots(figsize=(10, 8))
-                    sns.scatterplot(data=plot_df, x='Dim1', y='Dim2', ax=ax)
-                    
-                    # Add labels to points
-                    for _, row in plot_df.iterrows():
-                        ax.text(row['Dim1'], row['Dim2'], row['Code'], fontsize=9)
-                    
-                    plt.title(f'First 2 Dimensions of {n_components}-D Reduced Embeddings')
-                    st.pyplot(fig)
-
-# XGBoost Prediction Page
-elif page == "XGBoost Prediction":
-    st.header("Step 4: Predict Allowed Amount with XGBoost")
+        # Display sample cosine similarities
+        st.subheader("Sample Embedding Similarities:")
+        
+        # Let's check if diabetes codes are similar
+        if "E11.9" in embeddings and "E10.9" in embeddings:
+            diabetes_sim = np.dot(embeddings["E11.9"], embeddings["E10.9"]) / (
+                np.linalg.norm(embeddings["E11.9"]) * np.linalg.norm(embeddings["E10.9"])
+            )
+            st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'E10.9' (Type 1 diabetes): {diabetes_sim:.4f}")
+        
+        # Check if asthma codes are similar
+        if "J45.909" in embeddings and "J45.20" in embeddings:
+            asthma_sim = np.dot(embeddings["J45.909"], embeddings["J45.20"]) / (
+                np.linalg.norm(embeddings["J45.909"]) * np.linalg.norm(embeddings["J45.20"])
+            )
+            st.write(f"Similarity between 'J45.909' (Unspecified asthma) and 'J45.20' (Mild asthma): {asthma_sim:.4f}")
+        
+        # Check if unrelated codes are less similar
+        if "E11.9" in embeddings and "J45.909" in embeddings:
+            unrelated_sim = np.dot(embeddings["E11.9"], embeddings["J45.909"]) / (
+                np.linalg.norm(embeddings["E11.9"]) * np.linalg.norm(embeddings["J45.909"])
+            )
+            st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'J45.909' (Asthma): {unrelated_sim:.4f}")
     
-    if st.session_state.reduced_embeddings is None:
-        st.warning("Please reduce embedding dimensions first.")
-    elif st.session_state.raw_data is None:
-        st.warning("Please prepare your data first.")
-    else:
-        st.write("We'll use XGBoost to predict allowed amounts using the reduced embeddings.")
+    # Step 3: Reduce Dimensions
+    with st.spinner("Reducing embedding dimensions to 10..."):
+        # Reduce to 10 dimensions
+        reduced_embeddings, reducer = reduce_dimensions(embeddings, n_components=10)
         
-        # Prepare data for modeling
-        if st.button("Train XGBoost Model"):
-            with st.spinner("Preparing data and training model..."):
-                # Get embedding dimension
-                first_code = list(st.session_state.reduced_embeddings.keys())[0]
-                embedding_dim = len(st.session_state.reduced_embeddings[first_code])
-                
-                # Prepare features and target
-                X, y = prepare_modeling_data(
-                    st.session_state.raw_data, 
-                    st.session_state.reduced_embeddings,
-                    embedding_dim
-                )
-                
-                # Feature names (for SHAP later)
-                feature_names = ['age', 'gender'] + [f'emb_dim_{i+1}' for i in range(embedding_dim)]
-                
-                # Split data
-                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                
-                # Train model
-                model = train_xgboost(X_train, y_train)
-                st.session_state.model = model
-                st.session_state.X_test = X_test
-                st.session_state.y_test = y_test
-                st.session_state.feature_names = feature_names
-                
-                # Evaluate model
-                predictions, mae, rmse, r2 = evaluate_model(model, X_test, y_test)
-                
-                st.success("Model training complete!")
-                
-                # Display metrics
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Mean Absolute Error", f"${mae:.2f}")
-                col2.metric("Root Mean Squared Error", f"${rmse:.2f}")
-                col3.metric("R² Score", f"{r2:.4f}")
-                
-                # Plot actual vs predicted
-                st.write("Actual vs Predicted Allowed Amounts:")
-                fig, ax = plt.subplots(figsize=(10, 6))
-                ax.scatter(y_test, predictions, alpha=0.5)
-                ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
-                ax.set_xlabel('Actual Amount ($)')
-                ax.set_ylabel('Predicted Amount ($)')
-                ax.set_title('Actual vs Predicted Allowed Amounts')
-                st.pyplot(fig)
-                
-                # Feature importance plot
-                st.write("XGBoost Feature Importance:")
-                importance_df = pd.DataFrame({
-                    'Feature': feature_names,
-                    'Importance': model.feature_importances_
-                }).sort_values(by='Importance', ascending=False)
-                
-                fig, ax = plt.subplots(figsize=(10, 6))
-                sns.barplot(x='Importance', y='Feature', data=importance_df, ax=ax)
-                ax.set_title('XGBoost Feature Importance')
-                st.pyplot(fig)
-
-# SHAP Explanation Page
-elif page == "SHAP Explanation":
-    st.header("Step 5: Explain Predictions with SHAP")
+        # Display reduced embedding information
+        st.success(f"Reduced embeddings to 10 dimensions.")
+        
+        # Show example of reduced embedding
+        first_reduced = reduced_embeddings[first_code]
+        st.write(f"Example reduced embedding for '{first_code}':")
+        st.write(pd.DataFrame([first_reduced], columns=[f"Dim {i+1}" for i in range(10)]))
+        
+        # Show explained variance
+        explained_variance = reducer.explained_variance_ratio_
+        cum_explained_variance = np.cumsum(explained_variance)
+        
+        st.write("Explained variance by dimension:")
+        variance_df = pd.DataFrame({
+            "Dimension": [f"Dim {i+1}" for i in range(10)],
+            "Explained Variance": explained_variance,
+            "Cumulative Explained Variance": cum_explained_variance
+        })
+        st.dataframe(variance_df)
+        
+        st.write(f"Total variance explained by 10 dimensions: {cum_explained_variance[-1]:.4f} ({cum_explained_variance[-1]*100:.2f}%)")
     
-    if st.session_state.model is None:
-        st.warning("Please train an XGBoost model first.")
-    else:
-        st.write("We'll use SHAP (SHapley Additive exPlanations) to explain the predictions.")
+    # Step 4: Prepare Data for XGBoost
+    with st.spinner("Preparing data for XGBoost model..."):
+        # Prepare features and target
+        X, y, member_ids = prepare_modeling_data(df, reduced_embeddings, embedding_dim=10)
         
-        if st.button("Calculate SHAP Values"):
-            with st.spinner("Calculating SHAP values..."):
-                # Calculate SHAP values
-                shap_values = calculate_shap(st.session_state.model, st.session_state.X_test)
-                st.session_state.shap_values = shap_values
-                
-                st.success("SHAP values calculated!")
-                
-                # Summary plot
-                st.write("SHAP Summary Plot:")
-                fig, ax = plt.subplots(figsize=(10, 8))
-                shap.summary_plot(shap_values, st.session_state.X_test, 
-                                  feature_names=st.session_state.feature_names,
-                                  show=False)
-                st.pyplot(fig)
-                
-                # Bar plot
-                st.write("SHAP Mean Absolute Impact:")
-                fig, ax = plt.subplots(figsize=(10, 6))
-                shap.summary_plot(shap_values, st.session_state.X_test,
-                                  feature_names=st.session_state.feature_names,
-                                  plot_type="bar", show=False)
-                st.pyplot(fig)
-                
-                # Sample explanation for a specific prediction
-                st.write("Sample Individual Prediction Explanation:")
-                sample_idx = 0
-                
-                # Show prediction details
-                actual = st.session_state.y_test[sample_idx]
-                predicted = st.session_state.model.predict(st.session_state.X_test[sample_idx].reshape(1, -1))[0]
-                
-                st.write(f"Sample Member:")
-                st.write(f"- Actual Allowed Amount: ${actual:.2f}")
-                st.write(f"- Predicted Allowed Amount: ${predicted:.2f}")
-                
-                # Waterfall plot
-                fig, ax = plt.subplots(figsize=(10, 8))
-                shap.waterfall_plot(shap_values[sample_idx], show=False)
-                st.pyplot(fig)
-                
-                # Force plot (convert to HTML)
-                st.write("SHAP Force Plot:")
-                force_plot = shap.plots.force(shap_values[sample_idx], matplotlib=True)
-                st.pyplot(force_plot)
-                
-                # Analysis of the embedding dimensions
-                st.write("Analysis of Embedding Dimensions:")
-                emb_dims = [f for f in st.session_state.feature_names if f.startswith('emb_dim_')]
-                emb_indices = [i for i, f in enumerate(st.session_state.feature_names) if f.startswith('emb_dim_')]
-                
-                if emb_indices:
-                    emb_importance = pd.DataFrame({
-                        'Dimension': emb_dims,
-                        'SHAP Impact': [np.abs(shap_values.values[:, i]).mean() for i in emb_indices]
-                    }).sort_values(by='SHAP Impact', ascending=False)
-                    
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    sns.barplot(x='SHAP Impact', y='Dimension', data=emb_importance, ax=ax)
-                    ax.set_title('Impact of Embedding Dimensions')
-                    st.pyplot(fig)
-                    
-                    st.write("This shows which dimensions of our ICD-10 embeddings are most influential in cost prediction.")
-
-st.sidebar.markdown("---")
-st.sidebar.info("""
-This application demonstrates how to:
-1. Create embeddings from ICD-10 code descriptions
-2. Reduce dimensions to a manageable size
-3. Use the embeddings to predict healthcare costs
-4. Explain predictions with SHAP values
-
-The embeddings capture semantic relationships between diagnoses, allowing the model to learn that similar conditions have similar effects on costs.
-""")
+        # Feature names
+        feature_names = ['age', 'gender'] + [f'emb_dim_{i+1}' for i in range(10)]
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        st.success(f"Prepared feature matrix with shape {X.shape} and target vector with shape {y.shape}")
+    
+    # Step 5: Train XGBoost Model
+    with st.spinner("Training XGBoost model..."):
+        # Train model
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42
+        )
+        model.fit(X_train, y_train)
+        
+        # Predictions
+        predictions = model.predict(X_test)
+        
+        # Metrics
+        mae = mean_absolute_error(y_test, predictions)
+        rmse = np.sqrt(mean_squared_error(y_test, predictions))
+        r2 = r2_score(y_test, predictions)
+        
+        st.success("Model training complete!")
+        
+        # Display metrics
+        st.subheader("Model Performance:")
+        metrics_df = pd.DataFrame({
+            "Metric": ["Mean Absolute Error", "Root Mean Squared Error", "R² Score"],
+            "Value": [f"${mae:.2f}", f"${rmse:.2f}", f"{r2:.4f}"]
+        })
+        st.dataframe(metrics_df)
+        
+        # Sample predictions
+        st.subheader("Sample Predictions:")
+        sample_indices = random.sample(range(len(X_test)), min(5, len(X_test)))
+        samples_df = pd.DataFrame({
+            "Actual": [f"${y_test[i]:.2f}" for i in sample_indices],
+            "Predicted": [f"${predictions[i]:.2f}" for i in sample_indices],
+            "Difference": [f"${(predictions[i] - y_test[i]):.2f}" for i in sample_indices]
+        })
+        st.dataframe(samples_df)
+    
+    # Step 6: Feature Importance and Impact
+    with st.spinner("Analyzing feature importance..."):
+        # Display feature importance
+        st.subheader("Feature Importance:")
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': model.feature_importances_
+        }).sort_values(by='Importance', ascending=False)
+        
+        st.dataframe(importance_df)
+        
+        # Calculate feature impact
+        st.subheader("Feature Impact Analysis:")
+        impacts = calculate_feature_impact(model, X_test, feature_names)
+        impact_df = pd.DataFrame({
+            'Feature': list(impacts.keys()),
+            'Impact': list(impacts.values())
+        }).sort_values(by='Impact', ascending=False)
+        
+        st.dataframe(impact_df)
+        
+        st.success("Analysis complete! Notice how some embedding dimensions have high importance - these capture meaningful patterns in the ICD-10 codes that predict costs.")
+        
+        # Final explanation
+        st.subheader("Summary:")
+        st.markdown("""
+        This demonstration shows how embeddings can effectively represent ICD-10 codes in a predictive model:
+        
+        1. We started with raw ICD-10 codes and their text descriptions
+        2. We used Word2Vec to create embeddings that place similar medical conditions near each other in vector space
+        3. We reduced the embeddings to exactly 10 dimensions using PCA
+        4. We used these embeddings along with demographic features to predict healthcare costs
+        5. We analyzed which embedding dimensions were most important for prediction
+        
+        The key advantage is that similar medical conditions have similar embeddings, allowing the model to generalize across related diagnoses.
+        """)

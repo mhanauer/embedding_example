@@ -11,11 +11,33 @@ import random
 # Set page config
 st.set_page_config(page_title="ICD-10 Embedding Demo", layout="wide")
 
-# App title and description
+# App title and comprehensive introduction
 st.title("ICD-10 Code Embedding for Healthcare Cost Prediction")
+
+# Introduction with detailed explanation
 st.markdown("""
-This application demonstrates how embedding ICD-10 diagnosis codes can improve healthcare cost prediction models.
-Instead of treating each code as a separate variable, we convert them into meaningful numerical vectors.
+## Introduction: Why Embeddings Matter for Healthcare Data
+
+### The Challenge of ICD-10 Codes in Machine Learning
+
+In healthcare analytics, ICD-10 diagnosis codes present a significant challenge. With over 70,000 possible codes, traditional one-hot encoding approaches create an impractically large number of sparse features. For example:
+
+- One-hot encoding turns each ICD-10 code into a separate binary column
+- This creates thousands of sparse columns where most values are zero
+- Models struggle with this high dimensionality and sparsity
+- Similar medical conditions (like Type 1 and Type 2 diabetes) are treated as completely unrelated entities
+
+### The Embedding Solution
+
+Embeddings solve this problem by representing ICD-10 codes as dense vectors in a continuous space where:
+
+- Each code is represented by a small vector (e.g., 10 numbers)
+- Similar medical conditions have similar vector representations
+- The semantic relationships between conditions are preserved
+- Thousands of possible codes are compressed into just a few numeric columns
+- Machine learning models can generalize across related conditions
+
+This application demonstrates how to create and use these embeddings to improve healthcare cost prediction models.
 """)
 
 # Sample data generator
@@ -234,7 +256,12 @@ def create_manual_embeddings(descriptions, dim=30):
         # Store the embedding
         embeddings[code] = embedding
     
-    return embeddings
+    # For reference, create reverse mapping of dimensions to medical concepts
+    dim_to_concept = {}
+    for term, dim_idx in term_to_dim.items():
+        dim_to_concept[dim_idx] = term
+    
+    return embeddings, dim_to_concept
 
 # Function to compute cosine similarity
 def cosine_similarity(v1, v2):
@@ -261,7 +288,7 @@ def reduce_dimensions(embeddings_dict, n_components=10):
     # Create a new dictionary mapping codes to reduced embeddings
     reduced_dict = {codes[i]: reduced_embeddings[i] for i in range(len(codes))}
     
-    return reduced_dict, reducer
+    return reduced_dict, reducer, codes
 
 # Function to prepare data for modeling
 def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
@@ -272,6 +299,7 @@ def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
     X_data = []
     y_data = []
     member_ids = []
+    member_codes = []
     
     for member_id, group in member_groups:
         # Get demographic features (same for all rows of this member)
@@ -280,6 +308,7 @@ def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
         
         # Get all ICD-10 codes for this member
         codes = group['icd10_code'].tolist()
+        member_codes.append(codes)
         
         # Average the embeddings for all codes
         if codes:
@@ -298,7 +327,7 @@ def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
         y_data.append(target)
         member_ids.append(member_id)
     
-    return np.array(X_data), np.array(y_data), member_ids
+    return np.array(X_data), np.array(y_data), member_ids, member_codes
 
 # Calculate feature impact (simplified SHAP alternative)
 def calculate_feature_impact(model, X, feature_names, n_samples=100):
@@ -325,8 +354,114 @@ def calculate_feature_impact(model, X, feature_names, n_samples=100):
     # Return as a dict
     return {feature_names[i]: impact[i] for i in range(len(feature_names))}
 
+# NEW: Function to interpret the embedding dimensions in terms of ICD-10 codes
+def interpret_embedding_dimensions(reducer, original_embeddings, codes, dim_to_concept, top_n=5):
+    # Get the PCA components
+    components = reducer.components_
+    
+    # Dictionary to store interpretations
+    interpretations = {}
+    
+    # For each reduced dimension
+    for dim_idx in range(components.shape[0]):
+        # Get the weights of original dimensions for this reduced dimension
+        weights = components[dim_idx]
+        
+        # Get the top original dimensions for this reduced dimension
+        top_indices = np.argsort(np.abs(weights))[-top_n:]
+        
+        # Get the concepts associated with these original dimensions
+        top_concepts = [dim_to_concept.get(idx, f"Unknown-{idx}") for idx in top_indices]
+        top_weights = [weights[idx] for idx in top_indices]
+        
+        # Create interpretation for this dimension
+        concept_str = ", ".join([f"{concept} ({weight:.3f})" for concept, weight in zip(top_concepts, top_weights)])
+        interpretations[dim_idx] = concept_str
+        
+        # Also find the ICD-10 codes that have high values in this dimension
+        code_values = []
+        for code_idx, code in enumerate(codes):
+            reduced_vec = reducer.transform([original_embeddings[code]])[0]
+            code_values.append((code, reduced_vec[dim_idx]))
+        
+        # Sort by absolute value and get top codes
+        code_values.sort(key=lambda x: abs(x[1]), reverse=True)
+        top_codes = code_values[:top_n]
+        
+        # Add to interpretation
+        code_str = ", ".join([f"{code} ({value:.3f})" for code, value in top_codes])
+        interpretations[dim_idx] = f"{concept_str}\nTop ICD-10 codes: {code_str}"
+    
+    return interpretations
+
+# NEW: Function to find most important ICD-10 codes based on feature importance
+def identify_important_codes(model, feature_names, reduced_embeddings, codes, icd_descriptions, top_n=5):
+    # Get feature importances from the model
+    importances = model.feature_importances_
+    
+    # Find indices of embedding dimensions
+    embedding_indices = [i for i, name in enumerate(feature_names) if name.startswith('emb_dim_')]
+    
+    # Get importances of embedding dimensions
+    embedding_importances = [(i-2, importances[i]) for i in embedding_indices]  # -2 to account for age,gender
+    
+    # Sort by importance
+    embedding_importances.sort(key=lambda x: x[1], reverse=True)
+    
+    # Get top important dimensions
+    top_dimensions = embedding_importances[:top_n]
+    
+    # For each important dimension, find codes with highest values
+    important_codes = []
+    
+    for dim_idx, importance in top_dimensions:
+        # Calculate influence of each code
+        code_influences = []
+        
+        for code in codes:
+            # Get the value of this code in this dimension
+            dim_value = reduced_embeddings[code][dim_idx]
+            
+            # Calculate influence as value * importance
+            influence = abs(dim_value * importance)
+            
+            code_influences.append((code, influence, dim_value, icd_descriptions.get(code, '')))
+        
+        # Sort by influence
+        code_influences.sort(key=lambda x: x[1], reverse=True)
+        
+        # Add top codes for this dimension
+        dimension_name = f"emb_dim_{dim_idx+1}"
+        for code, influence, dim_value, desc in code_influences[:3]:
+            important_codes.append({
+                'Dimension': dimension_name,
+                'Dimension Importance': importance,
+                'ICD-10 Code': code,
+                'Description': desc,
+                'Dimension Value': dim_value,
+                'Overall Influence': influence
+            })
+    
+    return pd.DataFrame(important_codes)
+
 # Main workflow
 st.header("Step 1: Generate Sample Data")
+
+# Enhanced explanation for data generation
+st.markdown("""
+### Why This Step Matters
+
+In real healthcare analytics, data would come from claims or EHR systems. Here, we're generating synthetic data that represents:
+
+- **Members with multiple diagnoses**: Each member can have 1-3 ICD-10 diagnosis codes
+- **Demographic information**: Age and gender, which affect healthcare costs
+- **Allowed amounts**: The total healthcare cost for each member, affected by their diagnoses
+
+This simulates a payer dataset where we need to predict costs based on members' health conditions. The relationship between diagnoses and costs is critical - certain conditions like diabetes or chronic pain significantly increase healthcare expenditures.
+
+**Key Point**: In real-world healthcare data, we often have hundreds or thousands of unique ICD-10 codes. Using traditional one-hot encoding would create an impractically large feature matrix.
+""")
+
 num_members = st.slider("Number of members:", 100, 1000, 500)
 
 if st.button("Generate Sample Data and Run Full Pipeline"):
@@ -348,9 +483,33 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         st.dataframe(codes_df)
     
     # Step 2: Create Embeddings
+    st.header("Step 2: Create ICD-10 Code Embeddings")
+    
+    # Enhanced explanation for embedding creation
+    st.markdown("""
+    ### Why Embeddings Are Critical
+    
+    In this step, we transform each ICD-10 code from a categorical value into a meaningful numerical vector. This is the core innovation that allows us to:
+    
+    1. **Represent semantic relationships**: Similar medical conditions get similar vectors
+    2. **Capture hierarchical structure**: The ICD-10 system has inherent hierarchy (e.g., all E11.x codes are Type 2 diabetes variants)
+    3. **Enable numerical processing**: Convert text-based medical concepts into numbers that ML models can process
+    4. **Reduce dimensionality**: Instead of thousands of sparse columns, we get a small number of dense features
+    
+    **Traditional Approach (One-Hot Encoding):**
+    - E11.9 → [0,0,1,0,0,0,0,0,0,0,0,0,0,...thousands more zeros...]
+    - E11.51 → [0,0,0,1,0,0,0,0,0,0,0,0,0,...thousands more zeros...]
+    
+    **Embedding Approach:**
+    - E11.9 → [0.235, -0.412, 0.178, 0.051, -0.133, 0.273, -0.084, 0.318, -0.221, 0.192]
+    - E11.51 → [0.267, -0.395, 0.149, 0.062, -0.155, 0.301, -0.079, 0.302, -0.209, 0.201]
+    
+    Notice how the vectors for related conditions (both Type 2 diabetes codes) are similar. This lets the model generalize across related conditions.
+    """)
+    
     with st.spinner("Creating embeddings from ICD-10 descriptions..."):
         # Create manual embeddings
-        embeddings = create_manual_embeddings(icd_descriptions)
+        embeddings, dim_to_concept = create_manual_embeddings(icd_descriptions)
         
         # Display embedding information
         first_code = list(embeddings.keys())[0]
@@ -375,10 +534,42 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
             unrelated_sim = cosine_similarity(embeddings["E11.9"], embeddings["J45.909"])
             st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'J45.909' (Asthma): {unrelated_sim:.4f}")
     
+        # Enhanced explanation of similarity results
+        st.markdown("""
+        ### Understanding the Similarities
+        
+        These similarity scores demonstrate a key benefit of embeddings:
+        
+        - **High similarity between related conditions**: Type 1 and Type 2 diabetes have similar vectors despite being different codes
+        - **High similarity between variants of the same condition**: Different asthma types have similar vectors
+        - **Low similarity between unrelated conditions**: Diabetes and asthma have very different vectors
+        
+        This pattern recognition is impossible with one-hot encoding, where every code is equally different from every other code.
+        
+        In production systems, we would use more sophisticated embedding approaches like Med2Vec, GRAM, or transformer-based models trained on medical literature. These create even more nuanced embeddings that capture complex medical relationships.
+        """)
+    
     # Step 3: Reduce Dimensions
+    st.header("Step 3: Reduce Embedding Dimensions")
+    
+    # Enhanced explanation for dimensionality reduction
+    st.markdown("""
+    ### Why Dimension Reduction Matters
+    
+    Our initial embeddings have 30 dimensions, but we can compress them further while preserving their important relationships. This step:
+    
+    1. **Improves computational efficiency**: Fewer dimensions mean faster model training and inference
+    2. **Reduces overfitting risk**: Fewer parameters help the model generalize better
+    3. **Removes noise**: Lower dimensions focus on the most important patterns in the data
+    4. **Makes visualization possible**: Lower dimensions are easier to visualize and understand
+    5. **Standardizes embedding size**: Ensures all ICD-10 codes are represented by exactly 10 values
+    
+    We use Principal Component Analysis (PCA) to find the dimensions that capture the most variance in our embeddings. This is like finding the "essence" of the medical conditions while discarding redundant information.
+    """)
+    
     with st.spinner("Reducing embedding dimensions to 10..."):
         # Reduce to 10 dimensions
-        reduced_embeddings, reducer = reduce_dimensions(embeddings, n_components=10)
+        reduced_embeddings, reducer, all_codes = reduce_dimensions(embeddings, n_components=10)
         
         # Display reduced embedding information
         st.success(f"Reduced embeddings to 10 dimensions.")
@@ -401,11 +592,55 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         st.dataframe(variance_df)
         
         st.write(f"Total variance explained by 10 dimensions: {cum_explained_variance[-1]:.4f} ({cum_explained_variance[-1]*100:.2f}%)")
+        
+        # NEW: Interpret what each dimension means
+        st.subheader("What Each Dimension Represents:")
+        
+        interpretations = interpret_embedding_dimensions(reducer, embeddings, all_codes, dim_to_concept)
+        
+        for dim_idx, interpretation in interpretations.items():
+            st.write(f"**Dimension {dim_idx + 1}**: {interpretation}")
+        
+        # Enhanced explanation of PCA results
+        st.markdown("""
+        ### Understanding the Explained Variance and Dimensions
+        
+        The table above shows how much information each dimension captures, while the interpretations show what medical concepts each dimension represents.
+        
+        - Each dimension is a combination of the original medical concept dimensions
+        - The ICD-10 codes listed for each dimension are those that have the strongest values in that dimension
+        - This helps us understand what each numerical dimension actually means in medical terms
+        
+        This interpretation is critical for making embeddings actionable in healthcare settings, as it connects the abstract numerical representations back to medical concepts that clinicians and administrators understand.
+        """)
     
     # Step 4: Prepare Data for XGBoost
+    st.header("Step 4: Prepare Data for Modeling")
+    
+    # Enhanced explanation for data preparation
+    st.markdown("""
+    ### Why Data Preparation Is Crucial
+    
+    This step transforms our raw data and embeddings into a format suitable for machine learning:
+    
+    1. **Patient-level aggregation**: Moves from diagnosis-level to patient-level data
+    2. **Multiple diagnosis handling**: Combines embeddings for patients with multiple conditions
+    3. **Feature matrix creation**: Creates a consistent set of features for each patient
+    4. **Demographic integration**: Combines embeddings with age and gender features
+    
+    The key innovation here is how we handle patients with multiple diagnoses. By averaging the embeddings of all a patient's conditions, we create a single vector that represents their overall health status. This approach:
+    
+    - Accounts for comorbidities (multiple conditions)
+    - Maintains consistent feature dimensions regardless of diagnosis count
+    - Preserves the semantic relationships between conditions
+    - Creates a holistic representation of patient health
+    
+    Without embeddings, handling multiple diagnoses would be much more complex and less effective.
+    """)
+    
     with st.spinner("Preparing data for XGBoost model..."):
         # Prepare features and target
-        X, y, member_ids = prepare_modeling_data(df, reduced_embeddings, embedding_dim=10)
+        X, y, member_ids, member_codes = prepare_modeling_data(df, reduced_embeddings, embedding_dim=10)
         
         # Feature names
         feature_names = ['age', 'gender'] + [f'emb_dim_{i+1}' for i in range(10)]
@@ -414,16 +649,54 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
         st.success(f"Prepared feature matrix with shape {X.shape} and target vector with shape {y.shape}")
+        
+        # Display feature matrix example
+        st.subheader("Example Feature Matrix:")
+        example_df = pd.DataFrame(X[:5], columns=feature_names)
+        st.dataframe(example_df)
+        
+        # Enhanced explanation of feature matrix
+        st.markdown("""
+        ### Understanding the Feature Matrix
+        
+        Each row in this matrix represents one member, with:
+        
+        - **Demographics**: Age and gender (first two columns)
+        - **Embedding dimensions**: The 10 embedding dimensions that represent their diagnoses
+        
+        This compact representation replaces what would otherwise be thousands of sparse binary columns in a one-hot encoding approach. The embedding dimensions capture complex patterns in the ICD-10 codes that relate to healthcare costs.
+        """)
     
     # Step 5: Train XGBoost Model
+    st.header("Step 5: Train XGBoost Model for Cost Prediction")
+    
+    # Enhanced explanation for XGBoost training
+    st.markdown("""
+    ### Why XGBoost Is Well-Suited for Embeddings
+    
+    XGBoost is a powerful gradient boosting algorithm that excels at finding complex patterns in data:
+    
+    1. **Handles non-linear relationships**: Can capture complex interactions between embeddings and costs
+    2. **Feature importance**: Identifies which embedding dimensions most impact costs
+    3. **Robust to irrelevant features**: Automatically identifies and focuses on important dimensions
+    4. **High performance**: Works well with the dense numerical features created by our embeddings
+    
+    The combination of embeddings and XGBoost is particularly powerful because:
+    
+    - Embeddings provide a rich, semantic representation of diagnoses
+    - XGBoost can identify complex patterns in these representations
+    - Together they can uncover nuanced relationships between medical conditions and costs
+    
+    This approach outperforms traditional one-hot encoding with linear models, which struggle with the high dimensionality and can't capture complex interactions.
+    """)
+    
     with st.spinner("Training XGBoost model..."):
         # Train model
         model = xgb.XGBRegressor(
             n_estimators=100,
             learning_rate=0.1,
             max_depth=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            subsample=0.8,colsample_bytree=0.8,
             random_state=42
         )
         model.fit(X_train, y_train)
@@ -446,6 +719,19 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         })
         st.dataframe(metrics_df)
         
+        # Enhanced explanation of metrics
+        st.markdown("""
+        ### Understanding Model Performance
+        
+        These metrics tell us how well our embedding-based approach predicts healthcare costs:
+        
+        - **Mean Absolute Error (MAE)**: Average dollar amount our predictions are off by
+        - **Root Mean Squared Error (RMSE)**: Similar to MAE but penalizes large errors more
+        - **R² Score**: Proportion of variance explained (higher is better, 1.0 is perfect)
+        
+        In real-world healthcare settings, even small improvements in these metrics can translate to millions of dollars in better financial planning and risk adjustment.
+        """)
+        
         # Sample predictions
         st.subheader("Sample Predictions:")
         sample_indices = random.sample(range(len(X_test)), min(5, len(X_test)))
@@ -457,7 +743,25 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         st.dataframe(samples_df)
     
     # Step 6: Feature Importance and Impact
-    with st.spinner("Analyzing feature importance..."):
+    st.header("Step 6: Analyze Feature Importance and ICD-10 Code Significance")
+    
+    # Enhanced explanation for feature importance
+    st.markdown("""
+    ### Why Feature Analysis Is Essential
+    
+    Beyond prediction accuracy, we need to understand which factors drive healthcare costs. This analysis:
+    
+    1. **Identifies key cost drivers**: Shows which embedding dimensions most influence costs
+    2. **Provides interpretability**: Makes the "black box" of embeddings more transparent
+    3. **Informs interventions**: Helps payers focus on managing the most impactful conditions
+    4. **Validates embedding quality**: Confirms that our embeddings capture meaningful patterns
+    
+    Feature importance tells us which features were most useful for prediction, while feature impact shows the direction and magnitude of each feature's effect on costs.
+    
+    This level of insight is impossible with traditional one-hot encoding approaches, which would give us thousands of binary features with small individual impacts. With embeddings, we can identify meaningful patterns across related diagnoses.
+    """)
+    
+    with st.spinner("Analyzing feature importance and ICD-10 code significance..."):
         # Display feature importance
         st.subheader("Feature Importance:")
         importance_df = pd.DataFrame({
@@ -477,18 +781,56 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         
         st.dataframe(impact_df)
         
-        st.success("Analysis complete! Notice how some embedding dimensions have high importance - these capture meaningful patterns in the ICD-10 codes that predict costs.")
+        # NEW: Identify the most important ICD-10 codes based on the feature importance
+        st.subheader("Most Influential ICD-10 Codes for Cost Prediction:")
+        
+        important_codes_df = identify_important_codes(model, feature_names, reduced_embeddings, 
+                                                   all_codes, icd_descriptions)
+        
+        st.dataframe(important_codes_df)
+        
+        # Enhanced explanation of feature importance results
+        st.markdown("""
+        ### Interpreting the Results and Key ICD-10 Codes
+        
+        The feature importance analysis reveals:
+        
+        - **Which embedding dimensions matter most**: Some dimensions capture patterns that strongly predict costs
+        - **Relative importance of demographics vs. diagnoses**: How much age and gender matter compared to medical conditions
+        
+        The ICD-10 code analysis translates these abstract dimensions back into actionable medical information:
+        
+        - **Most influential diagnoses**: Specific ICD-10 codes that have the strongest impact on cost predictions
+        - **Direction of influence**: Which conditions tend to increase or decrease costs
+        - **Medical patterns**: Groups of related conditions that drive healthcare expenditures
+        
+        This translation from embedding dimensions back to specific diagnoses is critical for healthcare organizations to take action based on the model's insights. For example:
+        
+        - Care management teams can focus on members with high-impact conditions
+        - Risk adjustment teams can ensure proper documentation of cost-driving diagnoses
+        - Medical management can develop programs targeted at the most impactful conditions
+        """)
+        
+        st.success("Analysis complete! Now we can see not just which embedding dimensions matter, but which specific ICD-10 codes have the most influence on healthcare costs.")
         
         # Final explanation
-        st.subheader("Summary:")
+        st.header("Conclusion: From Embeddings Back to Actionable ICD-10 Insights")
         st.markdown("""
-        This demonstration shows how embeddings can effectively represent ICD-10 codes in a predictive model:
+        This demonstration completes the full cycle of ICD-10 analysis:
         
-        1. We started with raw ICD-10 codes and their text descriptions
-        2. We created embeddings that place similar medical conditions near each other in vector space
-        3. We reduced the embeddings to exactly 10 dimensions using PCA
-        4. We used these embeddings along with demographic features to predict healthcare costs
-        5. We analyzed which embedding dimensions were most important for prediction
+        1. **From codes to embeddings**: We transformed categorical ICD-10 codes into numerical vectors
+        2. **From raw embeddings to reduced dimensions**: We compressed the information to 10 key dimensions
+        3. **From dimensions to predictions**: We used these dimensions to predict healthcare costs
+        4. **From abstract dimensions back to specific codes**: We translated the model's insights back into actionable ICD-10 codes
         
-        The key advantage is that similar medical conditions have similar embeddings, allowing the model to generalize across related diagnoses.
+        This last step is crucial for real-world implementation. While embeddings are powerful for machine learning models, healthcare decision-makers need interpretable insights expressed in the language of medical conditions, not abstract mathematical dimensions.
+        
+        By connecting the abstract embedding dimensions back to specific ICD-10 codes, we've made the model's insights actionable for:
+        
+        - **Clinicians**: Who think in terms of medical conditions, not embedding dimensions
+        - **Care managers**: Who need to know which specific conditions to focus on
+        - **Financial planners**: Who need to understand which diagnoses drive costs
+        - **Risk adjusters**: Who need to ensure proper documentation of high-impact conditions
+        
+        This bidirectional translation - from codes to embeddings and back again - preserves the mathematical power of embeddings while maintaining the interpretability needed in healthcare.
         """)

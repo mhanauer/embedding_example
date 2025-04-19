@@ -5,6 +5,7 @@ import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from sklearn.decomposition import PCA
+from sentence_transformers import SentenceTransformer
 import string
 import random
 
@@ -16,7 +17,7 @@ st.title("ICD-10 Code Embedding for Healthcare Cost Prediction")
 
 # Introduction with detailed explanation
 st.markdown("""
-## Introduction: Direct One-to-One ICD-10 Code Embeddings
+## Direct ICD-10 Code Embeddings with Controlled Dimensionality
 
 ### The Challenge of ICD-10 Codes in Analytics
 
@@ -26,10 +27,10 @@ In healthcare analytics, ICD-10 codes present a significant challenge due to the
 
 This application demonstrates how to create and maintain direct one-to-one mappings between ICD-10 codes and their vector embeddings:
 
-1. Each ICD-10 code is represented by a fixed-length vector (e.g., 10 numbers)
-2. Similar medical conditions have similar vector representations
-3. We maintain an exact mapping of each code to its specific vector
-4. These vectors can be used as features in predictive models
+1. Each ICD-10 code is first represented by a high-dimensional vector using a pre-trained language model
+2. We then use PCA to reduce these vectors to exactly 10 dimensions while preserving their semantic relationships
+3. The one-to-one mapping between codes and embeddings is maintained throughout
+4. These fixed-size vectors can be used as features in predictive models
 5. We can always translate back from any vector to its corresponding ICD-10 code
 
 This approach allows us to:
@@ -112,141 +113,51 @@ def generate_sample_data(num_members=500):
     
     return df, icd_descriptions
 
-# Function to preprocess text
-def preprocess_text(text):
-    # Convert to lowercase
-    text = text.lower()
-    
-    # Remove punctuation
-    translator = str.maketrans('', '', string.punctuation)
-    text = text.translate(translator)
-    
-    # Tokenize
-    return text.split()
-
-# Create embeddings with direct one-to-one mapping
-def create_direct_embeddings(descriptions, embedding_dim=10, seed=42):
-    """Create embeddings that directly map each ICD-10 code to a specific vector"""
-    np.random.seed(seed)
-    
-    # Initialize the embedding dictionary
-    embeddings = {}
-    
-    # For each code
-    for code, desc in descriptions.items():
-        # Extract code prefix (e.g., E11, I10)
-        prefix = code.split('.')[0]
+# Function to create embeddings using a pre-trained model and reduce dimensions with PCA
+def create_pca_embeddings(descriptions, n_components=10):
+    """
+    Create embeddings for ICD-10 codes using a pre-trained model
+    and reduce dimensions using PCA
+    """
+    try:
+        # Try to load the model - if this fails, we'll show an error message
+        model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Medical category weight initialization (similar conditions will have similar initialization)
-        base_vector = np.zeros(embedding_dim)
+        # Generate the embeddings for each code description
+        codes = []
+        original_embeddings = []
         
-        # Set specific embedding values based on medical categories
-        if prefix.startswith('E1'):  # Diabetes codes
-            # Base pattern for diabetes
-            base_vector[0] = 0.8
-            base_vector[1] = -0.3
-            
-            # Differentiate Type 1 vs Type 2
-            if 'type 1' in desc.lower():
-                base_vector[2] = 0.7
-                base_vector[3] = -0.4
-            elif 'type 2' in desc.lower():
-                base_vector[2] = -0.6
-                base_vector[3] = 0.5
-                
-            # Complications
-            if 'complication' in desc.lower() or 'with' in desc.lower():
-                base_vector[4] = 0.6
-            else:
-                base_vector[4] = -0.6
-                
-        elif prefix.startswith('I'):  # Cardiovascular codes
-            base_vector[0] = -0.7
-            base_vector[1] = 0.9
-            
-            # Specific for hypertension
-            if 'hypertension' in desc.lower():
-                base_vector[2] = 0.8
-                base_vector[5] = 0.4
-                
-            # Heart-specific conditions
-            if 'heart' in desc.lower():
-                base_vector[3] = 0.6
-                base_vector[6] = 0.5
-                
-        elif prefix.startswith('J'):  # Respiratory codes
-            base_vector[0] = -0.5
-            base_vector[1] = -0.6
-            
-            # Asthma-specific
-            if 'asthma' in desc.lower():
-                base_vector[2] = -0.7
-                base_vector[7] = 0.8
-                
-                # Severity
-                if 'mild' in desc.lower():
-                    base_vector[8] = 0.6
-                elif 'severe' in desc.lower():
-                    base_vector[8] = -0.9
-                    
-        elif prefix.startswith('M'):  # Musculoskeletal codes
-            base_vector[0] = 0.4
-            base_vector[1] = 0.5
-            
-            # Back pain
-            if 'back' in desc.lower() and 'pain' in desc.lower():
-                base_vector[2] = 0.2
-                base_vector[9] = 0.7
-                
-        elif prefix.startswith('F'):  # Mental health codes
-            base_vector[0] = 0.2
-            base_vector[1] = -0.8
-            
-            # Anxiety vs depression
-            if 'anxiety' in desc.lower():
-                base_vector[3] = 0.7
-                base_vector[7] = -0.3
-            elif 'depress' in desc.lower():
-                base_vector[3] = -0.6
-                base_vector[7] = 0.4
-                
-        elif prefix.startswith('G'):  # Neurological codes
-            base_vector[0] = 0.3
-            base_vector[1] = 0.4
-            
-            # Pain vs migraines
-            if 'pain' in desc.lower():
-                base_vector[4] = 0.8
-                base_vector[8] = -0.5
-            elif 'migraine' in desc.lower():
-                base_vector[4] = -0.7
-                base_vector[8] = 0.6
-                
-        elif prefix.startswith('K'):  # Digestive system codes
-            base_vector[0] = -0.2
-            base_vector[1] = -0.4
-            
-            # GERD vs IBS
-            if 'reflux' in desc.lower() or 'gerd' in desc.lower():
-                base_vector[5] = 0.6
-                base_vector[9] = -0.3
-            elif 'irritable' in desc.lower() or 'ibs' in desc.lower():
-                base_vector[5] = -0.5
-                base_vector[9] = 0.7
+        for code, description in descriptions.items():
+            # Generate embedding for this description
+            embedding = model.encode(description)
+            codes.append(code)
+            original_embeddings.append(embedding)
         
-        # Add small amount of noise to make each code unique while maintaining pattern
-        noise = np.random.normal(0, 0.05, embedding_dim)
+        # Convert to numpy array
+        original_embeddings = np.array(original_embeddings)
         
-        # Final embedding
-        embedding = base_vector + noise
+        # Reduce dimensions with PCA
+        reducer = PCA(n_components=n_components)
+        reduced_embeddings = reducer.fit_transform(original_embeddings)
         
-        # Normalize to unit length for consistency
-        embedding = embedding / np.linalg.norm(embedding)
+        # Create dictionary mapping codes to reduced embeddings
+        embeddings_dict = {codes[i]: reduced_embeddings[i] for i in range(len(codes))}
         
-        # Store in dictionary
-        embeddings[code] = embedding
-    
-    return embeddings
+        # Create lookup dataframe
+        embedding_lookup = pd.DataFrame({
+            'ICD10_Code': codes,
+            'Description': [descriptions[code] for code in codes]
+        })
+        
+        # Add embedding columns
+        for i in range(n_components):
+            embedding_lookup[f'dim_{i}'] = [reduced_embeddings[i][j] for i in range(len(codes)) for j in range(n_components) if j == i][0:len(codes)]
+        
+        return embeddings_dict, reducer, embedding_lookup, True
+        
+    except Exception as e:
+        # If there's an error, return None and the error message
+        return None, None, None, False
 
 # Function to compute cosine similarity
 def cosine_similarity(v1, v2):
@@ -259,6 +170,20 @@ def cosine_similarity(v1, v2):
         return 0
     
     return dot_product / (norm_v1 * norm_v2)
+
+# Function to find the exact ICD-10 code for a given embedding
+def get_icd10_code(embedding_vector, embedding_lookup):
+    """Find the exact matching ICD-10 code for a given embedding vector"""
+    # Convert embedding columns to numpy array for comparison
+    dim_cols = [col for col in embedding_lookup.columns if col.startswith('dim_')]
+    saved_embeddings = embedding_lookup[dim_cols].values
+    
+    # Find exact match (or closest match if using approximate values)
+    distances = np.linalg.norm(saved_embeddings - embedding_vector, axis=1)
+    closest_idx = np.argmin(distances)
+    
+    # Return the corresponding ICD-10 code
+    return embedding_lookup.iloc[closest_idx]['ICD10_Code']
 
 # Function to prepare data for modeling
 def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
@@ -299,7 +224,7 @@ def prepare_modeling_data(df, embedding_dict, embedding_dim=10):
     
     return np.array(X_data), np.array(y_data), member_ids, member_codes
 
-# Calculate feature impact for each dimension
+# Calculate feature impact 
 def calculate_feature_impact(model, X, feature_names):
     # Initialize impact
     impact = np.zeros(X.shape[1])
@@ -324,22 +249,8 @@ def calculate_feature_impact(model, X, feature_names):
     # Return as a dict
     return {feature_names[i]: impact[i] for i in range(len(feature_names))}
 
-# Function to find the most similar ICD-10 code to a given embedding
-def find_most_similar_code(embedding, embedding_dict):
-    """Find the ICD-10 code with the most similar embedding"""
-    similarities = {}
-    
-    for code, code_embedding in embedding_dict.items():
-        similarity = cosine_similarity(embedding, code_embedding)
-        similarities[code] = similarity
-    
-    # Find the code with the highest similarity
-    most_similar_code = max(similarities.items(), key=lambda x: x[1])
-    
-    return most_similar_code[0], most_similar_code[1]
-
 # Function to identify important ICD-10 codes based on feature importance
-def identify_important_codes(model, feature_names, embeddings_dict, icd_descriptions, top_n=10):
+def identify_important_codes(model, feature_names, embeddings_dict, embedding_lookup, icd_descriptions, top_n=10):
     """Identify the most important ICD-10 codes based on feature importance"""
     # Get feature importances from the model
     importances = model.feature_importances_
@@ -418,92 +329,72 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         st.dataframe(codes_df)
     
     # Step 2: Create Embeddings
-    st.header("Step 2: Create Direct ICD-10 Code Embeddings")
+    st.header("Step 2: Create Direct ICD-10 Code Embeddings with PCA")
     
     # Explanation for embedding creation
     st.markdown("""
-    ### Creating Direct One-to-One ICD-10 Embeddings
+    ### Creating Direct One-to-One ICD-10 Embeddings with PCA
     
-    In this step, we create a direct mapping between each ICD-10 code and a specific 10-dimensional vector. These embeddings have critical properties:
+    In this step, we:
     
-    1. **One-to-One Mapping**: Each ICD-10 code has exactly one corresponding vector
-    2. **Semantic Similarity**: Codes for related conditions have similar vectors
-    3. **Fixed Dimensionality**: Each code is represented by exactly 10 numbers
-    4. **Consistency**: The same code always maps to the same vector
+    1. Use a pre-trained language model to create initial embeddings for each ICD-10 code description
+    2. Apply PCA to reduce these embeddings to exactly 10 dimensions
+    3. Maintain a direct one-to-one mapping between each code and its embedding
     
-    These embeddings allow us to represent ICD-10 codes in a way that's both mathematically useful and maintains direct interpretability.
+    This approach ensures that:
+    - Each ICD-10 code has exactly one corresponding vector
+    - Similar medical conditions have similar vectors
+    - Every vector has exactly 10 dimensions
     """)
     
     with st.spinner("Creating embeddings from ICD-10 descriptions..."):
-        # Create embeddings with direct mapping
+        # Create embeddings using pre-trained model and PCA
         embedding_dim = 10
-        embeddings = create_direct_embeddings(icd_descriptions, embedding_dim=embedding_dim)
+        embeddings_dict, reducer, embedding_lookup, success = create_pca_embeddings(icd_descriptions, n_components=embedding_dim)
+        
+        if not success:
+            st.error("Failed to create embeddings. Make sure the sentence-transformers package is installed.")
+            st.stop()
         
         # Display embedding information
-        st.success(f"Created {embedding_dim}-dimensional embeddings for {len(embeddings)} ICD-10 codes.")
+        st.success(f"Created {embedding_dim}-dimensional embeddings for {len(embeddings_dict)} ICD-10 codes.")
         
         # Show the exact embeddings for each code
         st.subheader("Direct ICD-10 Code to Embedding Mapping:")
-        
-        # Create a dataframe to display the mappings
-        embedding_rows = []
-        
-        for code, embedding in embeddings.items():
-            embedding_rows.append({
-                'ICD-10 Code': code,
-                'Description': icd_descriptions.get(code, ''),
-                'Embedding Vector': str(embedding.round(3).tolist())
-            })
-        
-        embedding_df = pd.DataFrame(embedding_rows)
-        st.dataframe(embedding_df)
+        st.dataframe(embedding_lookup)
         
         # Display sample cosine similarities
         st.subheader("Sample Embedding Similarities:")
         
         # Let's check if diabetes codes are similar
-        if "E11.9" in embeddings and "E10.9" in embeddings:
-            diabetes_sim = cosine_similarity(embeddings["E11.9"], embeddings["E10.9"])
+        if "E11.9" in embeddings_dict and "E10.9" in embeddings_dict:
+            diabetes_sim = cosine_similarity(embeddings_dict["E11.9"], embeddings_dict["E10.9"])
             st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'E10.9' (Type 1 diabetes): {diabetes_sim:.4f}")
         
         # Check if asthma codes are similar
-        if "J45.909" in embeddings and "J45.20" in embeddings:
-            asthma_sim = cosine_similarity(embeddings["J45.909"], embeddings["J45.20"])
+        if "J45.909" in embeddings_dict and "J45.20" in embeddings_dict:
+            asthma_sim = cosine_similarity(embeddings_dict["J45.909"], embeddings_dict["J45.20"])
             st.write(f"Similarity between 'J45.909' (Unspecified asthma) and 'J45.20' (Mild asthma): {asthma_sim:.4f}")
         
         # Check if unrelated codes are less similar
-        if "E11.9" in embeddings and "J45.909" in embeddings:
-            unrelated_sim = cosine_similarity(embeddings["E11.9"], embeddings["J45.909"])
+        if "E11.9" in embeddings_dict and "J45.909" in embeddings_dict:
+            unrelated_sim = cosine_similarity(embeddings_dict["E11.9"], embeddings_dict["J45.909"])
             st.write(f"Similarity between 'E11.9' (Type 2 diabetes) and 'J45.909' (Asthma): {unrelated_sim:.4f}")
-        
-        # Explanation of embedding properties
-        st.markdown("""
-        ### Understanding the Embeddings
-        
-        These embeddings demonstrate important properties:
-        
-        - **High similarity between related conditions**: Type 1 and Type 2 diabetes have similar vectors
-        - **High similarity between variants of the same condition**: Different asthma types have similar vectors
-        - **Low similarity between unrelated conditions**: Diabetes and asthma have very different vectors
-        
-        Each code has its own unique vector, but the patterns in these vectors capture the relationships between medical conditions.
-        """)
         
         # Demonstrate the ability to find the most similar code to a given embedding
         st.subheader("Embedding to ICD-10 Code Reverse Lookup:")
         
         # Pick a random code to demonstrate
-        sample_code = random.choice(list(embeddings.keys()))
-        sample_embedding = embeddings[sample_code]
+        sample_code = random.choice(list(embeddings_dict.keys()))
+        sample_embedding = embeddings_dict[sample_code]
         
         st.write(f"Starting with the embedding for '{sample_code}' ({icd_descriptions.get(sample_code, '')}):")
         st.write(f"Embedding vector: {sample_embedding.round(3).tolist()}")
         
-        # Find the most similar code
-        most_similar_code, similarity = find_most_similar_code(sample_embedding, embeddings)
+        # Find the most similar code using our lookup function
+        most_similar_code = get_icd10_code(sample_embedding, embedding_lookup)
         
         st.write(f"Most similar code: '{most_similar_code}' ({icd_descriptions.get(most_similar_code, '')})")
-        st.write(f"Similarity: {similarity:.4f}")
         
         # Explain the significance
         st.markdown("""
@@ -532,7 +423,7 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
     
     with st.spinner("Preparing data for XGBoost model..."):
         # Prepare features and target
-        X, y, member_ids, member_codes = prepare_modeling_data(df, embeddings, embedding_dim=embedding_dim)
+        X, y, member_ids, member_codes = prepare_modeling_data(df, embeddings_dict, embedding_dim=embedding_dim)
         
         # Feature names
         feature_names = ['age', 'gender'] + [f'emb_dim_{i+1}' for i in range(embedding_dim)]
@@ -620,7 +511,7 @@ if st.button("Generate Sample Data and Run Full Pipeline"):
         # Identify the most important ICD-10 codes
         st.subheader("Most Important ICD-10 Codes for Cost Prediction:")
         
-        important_codes_df = identify_important_codes(model, feature_names, embeddings, icd_descriptions)
+        important_codes_df = identify_important_codes(model, feature_names, embeddings_dict, embedding_lookup, icd_descriptions)
         
         st.dataframe(important_codes_df)
         
